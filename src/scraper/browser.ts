@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
 import { config } from '../utils/config.js'
 import { logger } from '../utils/logger.js'
 import { confirm } from '@inquirer/prompts'
+import { detectPageAccessState, type PageAccessState } from './page-access.js'
 
 export class BrowserManager {
   static readonly BrowserLaunchError = class extends Error {
@@ -46,16 +47,14 @@ export class BrowserManager {
         await this.launchBrowser(config.headless)
         await this.initializeBrowserContext()
         await this.navigateToSettingsPage()
-        const isLoggedIn = await this.verifyLoginStatus(this.getActivePage())
+        const initialAccessState = await this.getPageAccessState(this.getActivePage())
 
-        if (isLoggedIn) {
+        if (initialAccessState === 'authenticated') {
           logger.success('Already logged in!')
           return this.getActivePage()
         }
 
-        logger.warn(
-          'Saved authentication expired or invalid. Restarting in headful mode for login...'
-        )
+        logger.warn(this.getHeadfulFallbackMessage(initialAccessState))
         await this.close()
       }
 
@@ -67,11 +66,10 @@ export class BrowserManager {
 
       // If user wants headless, restart now that we are logged in
       if (config.headless !== false) {
-        logger.info('Authentication successful. Restarting in headless mode...')
-        await this.close()
-        await this.launchBrowser(config.headless)
-        await this.initializeBrowserContext()
-        await this.navigateToSettingsPage()
+        const restoredPage = await this.tryRestoreAuthenticatedHeadlessSession()
+        if (restoredPage) {
+          return restoredPage
+        }
       }
 
       return this.getActivePage()
@@ -161,16 +159,17 @@ export class BrowserManager {
       throw new BrowserManager.AuthError('Page not initialized')
     }
 
-    const isActuallyLoggedIn = await this.verifyLoginStatus(this.activePage)
+    const initialAccessState = await this.getPageAccessState(this.activePage)
 
-    if (isActuallyLoggedIn) {
+    if (initialAccessState === 'authenticated') {
       logger.success('Already logged in!')
       return
     }
 
     logger.info('Please log in manually in the browser window...')
     await confirm({
-      message: 'Press Enter when you are logged in and on the settings page',
+      message:
+        'Press Enter when you are logged in, past any security checks, and on the settings page',
       default: true,
     })
 
@@ -179,8 +178,14 @@ export class BrowserManager {
       waitUntil: 'networkidle',
     })
 
-    const isLoginSuccessfulNow = await this.verifyLoginStatus(this.activePage)
-    if (!isLoginSuccessfulNow) {
+    const currentAccessState = await this.getPageAccessState(this.activePage)
+    if (currentAccessState !== 'authenticated') {
+      if (currentAccessState === 'challenge') {
+        throw new BrowserManager.AuthError(
+          'Perplexity is still showing a security verification page. Complete it in the browser window and try again.'
+        )
+      }
+
       throw new BrowserManager.AuthError(
         `Login verification failed. Current URL: ${this.activePage.url()}`
       )
@@ -191,21 +196,7 @@ export class BrowserManager {
   }
 
   private async verifyLoginStatus(page: Page): Promise<boolean> {
-    await page.waitForTimeout(1000).catch(() => {})
-    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
-    const currentUrl = page.url()
-
-    const authenticatedUrlPaths = ['/settings', '/library', '/collections', '/account/details']
-    if (authenticatedUrlPaths.some((path) => currentUrl.includes(path))) {
-      return true
-    }
-
-    const userMenuElementCount = await page
-      .locator('[data-testid="user-menu"]')
-      .count()
-      .catch(() => 0)
-
-    return userMenuElementCount > 0
+    return (await this.getPageAccessState(page)) === 'authenticated'
   }
 
   private async persistAuthenticationState(): Promise<void> {
@@ -221,5 +212,88 @@ export class BrowserManager {
       throw new BrowserManager.ContextError('Page not initialized')
     }
     return this.activePage
+  }
+
+  private async getPageAccessState(page: Page): Promise<PageAccessState> {
+    await page.waitForTimeout(1000).catch(() => {})
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+
+    const [title, bodyText, userMenuCount, signInButtonCount, signInLinkCount, cookies] =
+      await Promise.all([
+        page.title().catch(() => ''),
+        page
+          .locator('body')
+          .innerText()
+          .catch(() => ''),
+        page
+          .locator('[data-testid="user-menu"]')
+          .count()
+          .catch(() => 0),
+        page
+          .getByRole('button', { name: /sign in|log in/i })
+          .count()
+          .catch(() => 0),
+        page
+          .getByRole('link', { name: /sign in|log in/i })
+          .count()
+          .catch(() => 0),
+        page
+          .context()
+          .cookies(page.url())
+          .catch(() => []),
+      ])
+
+    const authCookieCount = cookies.filter(
+      ({ name, value }) =>
+        Boolean(value) && /auth|token|clerk|__session|next-auth|authjs/i.test(name)
+    ).length
+
+    return detectPageAccessState({
+      title,
+      bodyText,
+      userMenuCount,
+      signInControlCount: signInButtonCount + signInLinkCount,
+      authCookieCount,
+    })
+  }
+
+  private getHeadfulFallbackMessage(accessState: PageAccessState): string {
+    if (accessState === 'challenge') {
+      return 'Perplexity blocked headless mode with a security verification page. Restarting in a visible browser...'
+    }
+
+    return 'Saved authentication expired or invalid. Restarting in headful mode for login...'
+  }
+
+  private async tryRestoreAuthenticatedHeadlessSession(): Promise<Page | null> {
+    logger.info('Authentication successful. Testing headless mode...')
+    await this.close()
+    await this.launchBrowser(config.headless)
+    await this.initializeBrowserContext()
+    await this.navigateToSettingsPage()
+
+    const headlessAccessState = await this.getPageAccessState(this.getActivePage())
+    if (headlessAccessState === 'authenticated') {
+      return this.getActivePage()
+    }
+
+    logger.warn(
+      headlessAccessState === 'challenge'
+        ? 'Perplexity blocked the fresh login in headless mode. Continuing in a visible browser instead.'
+        : 'Headless mode could not reuse the fresh login. Continuing in a visible browser instead.'
+    )
+
+    await this.close()
+    await this.launchBrowser(false)
+    await this.initializeBrowserContext()
+    await this.navigateToSettingsPage()
+
+    if (!(await this.verifyLoginStatus(this.getActivePage()))) {
+      throw new BrowserManager.AuthError(
+        'Authentication succeeded, but the session could not be restored after switching browser modes.'
+      )
+    }
+
+    return null
   }
 }

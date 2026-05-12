@@ -2,6 +2,11 @@ import type { BrowserContext, Page, Response } from '@playwright/test'
 import { waitStrategy } from '../utils/wait-strategy.js'
 import { logger } from '../utils/logger.js'
 import { z } from 'zod'
+import {
+  extractThreadIdFromSearchUrl,
+  hasMeaningfulThreadData,
+  isThreadDetailResponseUrl,
+} from './thread-response.js'
 
 export interface ExtractedConversation {
   id: string
@@ -108,7 +113,7 @@ export class ConversationExtractor {
       )
     }
 
-    const apiDataPromise = this.captureConversationApiResponse(page)
+    const apiDataPromise = this.captureConversationApiResponse(page, url)
 
     try {
       await this.navigateToConversationUrl(page, url)
@@ -148,7 +153,7 @@ export class ConversationExtractor {
     }
   }
 
-  private captureConversationApiResponse(page: Page): Promise<any> {
+  private captureConversationApiResponse(page: Page, threadUrl: string): Promise<any> {
     let resolved = false
 
     return new Promise((resolve) => {
@@ -164,7 +169,7 @@ export class ConversationExtractor {
         if (resolved) return
 
         const url = response.url()
-        if (!url.includes('/rest/thread/') || url.includes('list_ask_threads')) return
+        if (!isThreadDetailResponseUrl(url, threadUrl)) return
 
         logger.info(`Found matching thread API response: ${url}`)
 
@@ -177,9 +182,15 @@ export class ConversationExtractor {
           const json = await response.json()
           if (resolved) return
 
+          if (!hasMeaningfulThreadData(json)) {
+            logger.warn(`Ignoring thread response without meaningful content: ${url}`)
+            return
+          }
+
           const parseResult = ConversationExtractor.ApiResponseSchema.safeParse(json)
           if (!parseResult.success) {
             logger.warn(`API response validation failed: ${parseResult.error.message}`)
+            return
           }
 
           clearTimeout(timeout)
@@ -237,13 +248,25 @@ export class ConversationExtractor {
       }
 
       const validEntries = parseResult.data
-      const firstEntry = validEntries[0]!
+      const meaningfulEntries = validEntries.filter(
+        (entry) =>
+          !!entry.query_str?.trim() ||
+          (entry.thread_title?.trim() ?? '') !== '' ||
+          (entry.blocks ?? []).some((block) => !!block.markdown_block?.answer?.trim())
+      )
+
+      if (meaningfulEntries.length === 0) {
+        logger.warn(`Thread response contained no prompts or answers: ${url}`)
+        return null
+      }
+
+      const firstEntry = meaningfulEntries[0]!
       const id = this.extractIdFromUrl(url)
-      const title = firstEntry.thread_title ?? data.thread_title ?? 'Untitled'
+      const title = firstEntry.thread_title ?? data.thread_title ?? id ?? 'Untitled'
       const spaceName =
         firstEntry.collection_info?.title ?? data.collection_info?.title ?? 'General'
       const timestamp = this.extractTimestamp(firstEntry, data)
-      const content = this.convertEntriesToMarkdown(validEntries, title)
+      const content = this.convertEntriesToMarkdown(meaningfulEntries, title)
 
       if (!content) {
         logger.warn(`Thread has empty content after formatting: ${url}`)
@@ -271,8 +294,7 @@ export class ConversationExtractor {
   }
 
   private extractIdFromUrl(url: string): string {
-    const match = url.match(/\/search\/([^/?]+)/)
-    return match?.[1] ?? 'unknown'
+    return extractThreadIdFromSearchUrl(url) ?? 'unknown'
   }
 
   private extractTimestamp(firstEntry: any, data: any): Date {

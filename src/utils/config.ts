@@ -34,7 +34,7 @@ function parseEnvConfig(): Config {
   const defaultParallelWorkers = '5'
   const defaultCheckpointInterval = '10'
 
-  const rawHeadless = process.env['HEADLESS'] ?? 'true'
+  const rawHeadless = process.env['HEADLESS'] ?? 'false'
   let headlessValue: boolean | 'new' = true
   if (rawHeadless === 'false') {
     headlessValue = false

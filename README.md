@@ -113,6 +113,8 @@ Launch the system:
 npm run dev
 ```
 
+If Perplexity shows a bot or security verification page, keep the browser visible. Headless mode is often blocked, so `HEADLESS=false` is the safest default for full exports.
+
 ### Operational Directives
 
 - **Start scraper (Library)**: Initiates extraction. Authenticate manually if required.
